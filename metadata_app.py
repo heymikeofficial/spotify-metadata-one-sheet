@@ -87,14 +87,16 @@ def normalize_title(title):
     return title
 
 
-def musicbrainz_isrcs_by_upc(upc):
-    """Look up ISRCs from MusicBrainz using the release UPC barcode.
+def musicbrainz_lookup_by_upc(upc):
+    """Look up a release on MusicBrainz by its UPC barcode.
 
-    Returns a dict mapping normalized track title -> ISRC. MusicBrainz asks for
-    a descriptive User-Agent and ~1 request/second, both of which we respect.
+    Returns {"isrcs": {normalized_title: isrc}, "label": str|None}. MusicBrainz
+    asks for a descriptive User-Agent and ~1 request/second, both of which we
+    respect.
     """
+    empty = {"isrcs": {}, "label": None}
     if not upc:
-        return {}
+        return empty
     headers = {"User-Agent": USER_AGENT}
     try:
         search = requests.get(
@@ -104,18 +106,18 @@ def musicbrainz_isrcs_by_upc(upc):
         )
         releases = search.json().get("releases", [])
         if not releases:
-            return {}
+            return empty
         release_id = releases[0]["id"]
 
         time.sleep(1.1)  # be polite to MusicBrainz
         detail = requests.get(
             f"https://musicbrainz.org/ws/2/release/{release_id}",
-            params={"inc": "recordings+isrcs", "fmt": "json"},
+            params={"inc": "recordings+isrcs+labels", "fmt": "json"},
             headers=headers, timeout=15,
         )
         data = detail.json()
     except Exception:
-        return {}
+        return empty
 
     isrc_map = {}
     for medium in data.get("media", []):
@@ -124,7 +126,24 @@ def musicbrainz_isrcs_by_upc(upc):
             isrcs = recording.get("isrcs", [])
             if isrcs:
                 isrc_map[normalize_title(recording.get("title", ""))] = isrcs[0]
-    return isrc_map
+
+    label = None
+    for li in data.get("label-info", []):
+        name = (li.get("label") or {}).get("name")
+        if name:
+            label = name
+            break
+
+    return {"isrcs": isrc_map, "label": label}
+
+
+def label_from_copyrights(album):
+    """Last-resort label: the phonographic (P) copyright line from Spotify."""
+    for c in album.get("copyrights", []):
+        if c.get("type") == "P" and c.get("text"):
+            return c["text"]
+    copyrights = album.get("copyrights")
+    return copyrights[0]["text"] if copyrights else None
 
 
 def fetch_album_data(sp, album_id, progress):
@@ -139,7 +158,7 @@ def fetch_album_data(sp, album_id, progress):
         "name": album["name"],
         "artist": ", ".join(a["name"] for a in album["artists"]),
         "release_date": album.get("release_date", "—"),
-        "label": album.get("label", "—"),
+        "label": album.get("label"),  # often stripped by Spotify; filled in below
         "upc": upc or "—",
         "artwork_url": artwork_url,
     }
@@ -148,20 +167,33 @@ def fetch_album_data(sp, album_id, progress):
     items = album["tracks"]["items"]
     track_ids = [t["id"] for t in items if t.get("id")]
 
-    # Batch-fetch full track objects (gives us ISRCs from Spotify directly).
+    # Try to get ISRCs from Spotify directly. Spotify currently restricts the
+    # tracks endpoint for many apps (returns 403), so this may yield nothing —
+    # in which case we fall back to MusicBrainz below.
     progress.progress(55, text="Looking up ISRC codes on Spotify…")
     spotify_isrcs = {}
     for i in range(0, len(track_ids), 50):
-        batch = sp.tracks(track_ids[i : i + 50])["tracks"]
-        for t in batch:
-            spotify_isrcs[t["id"]] = t.get("external_ids", {}).get("isrc")
+        try:
+            batch = sp.tracks(track_ids[i : i + 50])["tracks"]
+            for t in batch:
+                spotify_isrcs[t["id"]] = t.get("external_ids", {}).get("isrc")
+        except Exception:
+            break  # Spotify restricted ISRC access — rely on MusicBrainz instead
 
-    # Anything Spotify didn't give us, try to backfill from MusicBrainz by UPC.
+    # Backfill from MusicBrainz (by UPC) whatever Spotify didn't give us —
+    # ISRCs and/or the record label.
     missing = [t["id"] for t in items if not spotify_isrcs.get(t["id"])]
     mb_map = {}
-    if missing:
-        progress.progress(75, text="Some ISRCs missing — checking MusicBrainz…")
-        mb_map = musicbrainz_isrcs_by_upc(upc)
+    if missing or not info["label"]:
+        progress.progress(75, text="Filling gaps from MusicBrainz…")
+        mb = musicbrainz_lookup_by_upc(upc)
+        mb_map = mb["isrcs"]
+        if not info["label"] and mb["label"]:
+            info["label"] = mb["label"]
+
+    # Final label fallback: the (P) copyright line from Spotify.
+    if not info["label"]:
+        info["label"] = label_from_copyrights(album) or "—"
 
     progress.progress(90, text="Assembling your one-sheet…")
     tracks = []

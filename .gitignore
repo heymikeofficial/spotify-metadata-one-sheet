@@ -10,3 +10,6 @@ venv/
 
 # macOS
 .DS_Store
+
+# Generated sample output
+SAMPLE_one_sheet.pdf
