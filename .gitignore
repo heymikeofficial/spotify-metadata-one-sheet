@@ -13,3 +13,6 @@ venv/
 
 # Generated sample output
 SAMPLE_one_sheet.pdf
+
+# spotipy token cache
+.cache
